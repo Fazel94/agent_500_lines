@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""A coding agent in <500 lines. Stdlib only.
+
+Speaks to any OpenAI-compatible /v1/chat/completions endpoint.
+Usage: python agent.py ["do the thing"]           (no prompt -> REPL)
+"""
+import json
+import os
+import pathlib
+import sys
+import urllib.error
+import urllib.request
+
+BASE_URL = os.environ.get("AGENT_BASE_URL", "https://api.openai.com/v1")
+API_KEY = os.environ.get("AGENT_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+MODEL = os.environ.get("AGENT_MODEL", "gpt-4o-mini")
+ROOT = pathlib.Path.cwd()          # the agent may only touch files under here
+MAX_TOOL_OUTPUT = 20_000           # chars; tool results are truncated to this
+MAX_STEPS = 50                     # tool rounds per user turn
+
+
+def chat(messages: list, tools: list) -> dict:
+    """One blocking round-trip. Returns the assistant message dict."""
+    body = json.dumps({"model": MODEL, "messages": messages,
+                       "tools": tools, "tool_choice": "auto"}).encode()
+    req = urllib.request.Request(
+        f"{BASE_URL}/chat/completions", data=body,
+        headers={"Authorization": f"Bearer {API_KEY}",
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return json.loads(resp.read())["choices"][0]["message"]
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"API {e.code}: {e.read().decode()[:500]}")
+    except OSError as e:               # DNS, TLS, timeout, connection reset
+        raise RuntimeError(f"API unreachable: {e}")
+
+
+# --- tools -----------------------------------------------------------------
+# name -> (json schema shown to the model, python function that runs it)
+TOOLS: dict = {}
+
+
+def tool(desc, **params):
+    """Register a function as a tool. params: name=(json_type, help, required)."""
+    def deco(fn):
+        TOOLS[fn.__name__] = ({
+            "type": "function",
+            "function": {
+                "name": fn.__name__, "description": desc,
+                "parameters": {
+                    "type": "object",
+                    "properties": {k: {"type": t, "description": d}
+                                   for k, (t, d, _) in params.items()},
+                    "required": [k for k, (_, _, r) in params.items() if r]}}},
+            fn)
+        return fn
+    return deco
+
+
+def safe_path(p: str) -> pathlib.Path:
+    """Resolve p under ROOT, refusing anything that escapes the workspace."""
+    path = (ROOT / p).resolve()
+    if path != ROOT and not path.is_relative_to(ROOT):
+        raise ValueError(f"path escapes workspace: {p}")
+    return path
+
+
+@tool("Read a file. Returns its contents with 1-based line numbers.",
+      path=("string", "file path relative to the workspace root", True))
+def read_file(path):
+    f = safe_path(path)
+    if not f.is_file():
+        return "error: not found"
+    lines = f.read_text(errors="replace").splitlines()
+    return "\n".join(f"{i + 1}: {line}" for i, line in enumerate(lines))
+
+
+def run_tool(name: str, args: dict) -> str:
+    """Dispatch one tool call. Errors come back as text so the model can retry."""
+    if name not in TOOLS:
+        return f"error: unknown tool {name}"
+    try:
+        out = TOOLS[name][1](**args)
+    except Exception as e:
+        out = f"error: {type(e).__name__}: {e}"
+    if len(out) > MAX_TOOL_OUTPUT:
+        extra = len(out) - MAX_TOOL_OUTPUT
+        out = out[:MAX_TOOL_OUTPUT] + f"\n...[truncated {extra} chars]"
+    return out
+
+
+# --- agent loop ------------------------------------------------------------
+SYSTEM_PROMPT = f"""You are a coding agent working in {ROOT}.
+
+Use the tools to inspect the project before you change anything; never guess
+what a file contains. Prefer edit_file over rewriting a whole file with
+write_file.
+
+Work in small steps: one tool call, look at the result, decide the next one.
+When the task is done, stop calling tools and reply in plain text with what you
+changed and what the tests said. If you cannot do something, say so plainly."""
+
+
+def run_turn(messages: list) -> None:
+    """Drive the model until it answers with plain text (or hits the cap)."""
+    schemas = [s for s, _ in TOOLS.values()]
+    for _ in range(MAX_STEPS):
+        msg = chat(messages, schemas)
+        messages.append(msg)          # verbatim: tool_calls must round-trip
+        if msg.get("content"):
+            print(msg["content"])
+        if not msg.get("tool_calls"):
+            return
+        for call in msg["tool_calls"]:
+            name = call["function"]["name"]
+            raw = call["function"]["arguments"]
+            args = raw if isinstance(raw, dict) else json.loads(raw or "{}")
+            short = json.dumps(args)[:80]
+            print(f"\u2192 {name}({short})")
+            result = run_tool(name, args)
+            messages.append({"role": "tool", "tool_call_id": call["id"],
+                             "content": result})
+    messages.append({"role": "user",
+                     "content": "Stop: step limit reached. Summarize what you did."})
+    final = chat(messages, [])
+    messages.append(final)
+    print(final.get("content", ""))
+
+
+def main() -> None:
+    if not API_KEY and "api.openai.com" in BASE_URL:
+        sys.exit("set AGENT_API_KEY (or OPENAI_API_KEY), or point "
+                 "AGENT_BASE_URL at a local server")
+    prompt = " ".join(a for a in sys.argv[1:] if not a.startswith("-"))
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if prompt:                        # one-shot mode
+        messages.append({"role": "user", "content": prompt})
+        try:
+            run_turn(messages)
+        except RuntimeError as e:
+            sys.exit(str(e))
+        return
+    print(f"{MODEL} @ {BASE_URL} in {ROOT}  (ctrl-d to quit)")
+    while True:
+        try:
+            line = input("\n> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if line in ("exit", "quit"):
+            return
+        if not line:
+            continue
+        messages.append({"role": "user", "content": line})
+        try:
+            run_turn(messages)
+        except RuntimeError as e:      # API error: report it, keep the session
+            print(e)
+
+
+if __name__ == "__main__":
+    main()
