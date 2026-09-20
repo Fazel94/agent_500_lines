@@ -326,9 +326,19 @@ def compact(messages: list) -> None:
                         "content": f"Summary of earlier work:\n{summary}"}]
 
 
-def run_turn(messages: list) -> None:
-    """Drive the model until it answers with plain text (or hits the cap)."""
-    schemas = [s for s, _ in TOOLS.values()]
+def seal(messages: list) -> None:
+    """Make an interrupted transcript valid: every tool_call needs a result."""
+    answered = {m.get("tool_call_id") for m in messages if m.get("role") == "tool"}
+    for m in list(messages):
+        for call in m.get("tool_calls") or []:
+            if call["id"] not in answered:
+                messages.append({"role": "tool", "tool_call_id": call["id"],
+                                 "content": "cancelled by user"})
+    messages.append({"role": "user", "content": "[interrupted by the user]"})
+
+
+def steps(messages: list, schemas: list) -> None:
+    """The loop proper: model, tools, repeat."""
     for _ in range(MAX_STEPS):
         compact(messages)
         msg = chat(messages, schemas)
@@ -349,8 +359,16 @@ def run_turn(messages: list) -> None:
                              "content": result})
     messages.append({"role": "user",
                      "content": "Stop: step limit reached. Summarize what you did."})
-    final = chat(messages, [])
-    messages.append(final)
+    messages.append(chat(messages, []))
+
+
+def run_turn(messages: list) -> None:
+    """One turn, interruptible. Ctrl-C ends the turn, not the session."""
+    try:
+        steps(messages, [s for s, _ in TOOLS.values()])
+    except KeyboardInterrupt:
+        print("\n[cancelled]")
+        seal(messages)
 
 
 # --- sessions --------------------------------------------------------------
