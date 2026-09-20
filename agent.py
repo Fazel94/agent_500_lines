@@ -80,13 +80,20 @@ def walk(base: pathlib.Path):
 
 
 @tool("Read a file. Returns its contents with 1-based line numbers.",
-      path=("string", "file path relative to the workspace root", True))
-def read_file(path):
+      path=("string", "file path relative to the workspace root", True),
+      start=("integer", "first line to return (1-based, default 1)", False),
+      end=("integer", "last line to return (default: end of file)", False))
+def read_file(path, start=1, end=None):
     f = safe_path(path)
     if not f.is_file():
         return "error: not found"
     lines = f.read_text(errors="replace").splitlines()
-    return "\n".join(f"{i + 1}: {line}" for i, line in enumerate(lines))
+    start, end = max(int(start), 1), len(lines) if end is None else int(end)
+    out = "\n".join(f"{i}: {lines[i - 1]}"
+                    for i in range(start, min(end, len(lines)) + 1))
+    if end < len(lines):
+        out += f"\n...[{len(lines) - end} more lines; read them with start={end + 1}]"
+    return out or "(empty range)"
 
 
 @tool("Create or overwrite a file with exact content.",
