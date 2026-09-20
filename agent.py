@@ -173,6 +173,19 @@ def bash(command):
     return f"{p.stdout}{p.stderr}\n[exit {p.returncode}]"
 
 
+@tool("Ask the human a question and wait for their answer. Use only for a "
+      "decision the code cannot answer, never to ask permission.",
+      question=("string", "a single, specific question", True))
+def ask_user(question):
+    if AUTO_APPROVE:
+        return "error: running unattended (--yes); use your best judgement"
+    print(f"\n[?] {question}")
+    try:
+        return input("your answer: ").strip() or "(no answer given)"
+    except (EOFError, KeyboardInterrupt):
+        return "(no answer given)"
+
+
 def run_tool(name: str, args: dict) -> str:
     """Dispatch one tool call. Errors come back as text so the model can retry."""
     if name not in TOOLS:
