@@ -23,7 +23,8 @@ ROOT = pathlib.Path.cwd()          # the agent may only touch files under here
 MAX_TOOL_OUTPUT = 20_000           # chars; tool results are truncated to this
 MAX_STEPS = 50                     # tool rounds per user turn
 MAX_RETRIES = 4                    # attempts per API call before giving up
-SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv"}
+SKIP_DIRS = {".git", ".agent", "node_modules", "__pycache__", ".venv"}
+SESSION_DIR = ROOT / ".agent"      # transcripts, one JSON file per session
 AUTO_APPROVE = "--yes" in sys.argv or "-y" in sys.argv
 GATED = {"write_file", "edit_file", "bash"}
 
@@ -324,18 +325,47 @@ def run_turn(messages: list) -> None:
     messages.append(final)
 
 
+# --- sessions --------------------------------------------------------------
+def newest_session():
+    """The most recently written transcript, or None."""
+    files = sorted(SESSION_DIR.glob("*.json"), key=lambda f: f.stat().st_mtime)
+    return files[-1] if files else None
+
+
+def open_session(resume: bool):
+    """Return (messages, path). --resume reopens the newest transcript."""
+    if resume:
+        path = newest_session()
+        if path:
+            messages = json.loads(path.read_text())
+            print(f"[resumed {path.name}: {len(messages)} messages]")
+            return messages, path
+        print("[no session to resume; starting a new one]")
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    return ([{"role": "system", "content": SYSTEM_PROMPT}],
+            SESSION_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}.json")
+
+
+def save(messages: list, path: pathlib.Path) -> None:
+    """Write the whole transcript after every turn. It is just a list of dicts."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(messages, indent=1))
+
+
 def main() -> None:
     if not API_KEY and "api.openai.com" in BASE_URL:
         sys.exit("set AGENT_API_KEY (or OPENAI_API_KEY), or point "
                  "AGENT_BASE_URL at a local server")
     prompt = " ".join(a for a in sys.argv[1:] if not a.startswith("-"))
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages, path = open_session("--resume" in sys.argv or "-r" in sys.argv)
     if prompt:                        # one-shot mode
         messages.append({"role": "user", "content": prompt})
         try:
             run_turn(messages)
         except RuntimeError as e:
             sys.exit(str(e))
+        finally:
+            save(messages, path)
         return
     print(f"{MODEL} @ {BASE_URL} in {ROOT}  (ctrl-d to quit)")
     while True:
@@ -353,6 +383,7 @@ def main() -> None:
             run_turn(messages)
         except RuntimeError as e:      # API error: report it, keep the session
             print(e)
+        save(messages, path)
 
 
 if __name__ == "__main__":
