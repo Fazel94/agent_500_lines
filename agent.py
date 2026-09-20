@@ -76,6 +76,16 @@ def read_file(path):
     return "\n".join(f"{i + 1}: {line}" for i, line in enumerate(lines))
 
 
+@tool("Create or overwrite a file with exact content.",
+      path=("string", "file path relative to the workspace root", True),
+      content=("string", "full file content", True))
+def write_file(path, content):
+    f = safe_path(path)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(content)
+    return f"wrote {len(content.encode())} bytes to {path}"
+
+
 def run_tool(name: str, args: dict) -> str:
     """Dispatch one tool call. Errors come back as text so the model can retry."""
     if name not in TOOLS:
