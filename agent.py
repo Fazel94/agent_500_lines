@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -152,6 +153,17 @@ def grep(regex, path="."):
     return "\n".join(hits) or "(no matches)"
 
 
+@tool("Run a shell command in the workspace root. 60s timeout.",
+      command=("string", "shell command", True))
+def bash(command):
+    try:
+        p = subprocess.run(command, shell=True, cwd=ROOT, text=True,
+                           capture_output=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return "error: timed out after 60s"
+    return f"{p.stdout}{p.stderr}\n[exit {p.returncode}]"
+
+
 def run_tool(name: str, args: dict) -> str:
     """Dispatch one tool call. Errors come back as text so the model can retry."""
     if name not in TOOLS:
@@ -171,7 +183,8 @@ SYSTEM_PROMPT = f"""You are a coding agent working in {ROOT}.
 
 Use the tools to inspect the project before you change anything; never guess
 what a file contains. Prefer edit_file over rewriting a whole file with
-write_file.
+write_file. When tests exist, run them with bash before and after your change.
+Keep shell commands short and non-interactive.
 
 Work in small steps: one tool call, look at the result, decide the next one.
 When the task is done, stop calling tools and reply in plain text with what you
