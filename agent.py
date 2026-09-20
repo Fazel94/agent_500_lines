@@ -86,6 +86,25 @@ def write_file(path, content):
     return f"wrote {len(content.encode())} bytes to {path}"
 
 
+@tool("Replace an exact substring in a file. `old` must appear exactly once.",
+      path=("string", "file path relative to the workspace root", True),
+      old=("string", "exact text to replace, with enough context to be unique",
+           True),
+      new=("string", "replacement text", True))
+def edit_file(path, old, new):
+    f = safe_path(path)
+    if not f.is_file():
+        return "error: not found"
+    text = f.read_text()
+    n = text.count(old)
+    if n == 0:
+        return "error: old text not found"
+    if n > 1:
+        return f"error: old text occurs {n} times; include more context"
+    f.write_text(text.replace(old, new))
+    return "ok"
+
+
 def run_tool(name: str, args: dict) -> str:
     """Dispatch one tool call. Errors come back as text so the model can retry."""
     if name not in TOOLS:
