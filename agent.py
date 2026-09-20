@@ -8,6 +8,7 @@ import fnmatch
 import json
 import os
 import pathlib
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -128,6 +129,27 @@ def list_files(path=".", pattern="*"):
     if len(hits) > 500:
         out += f"\n...and {len(hits) - 500} more"
     return out or "(no matches)"
+
+
+@tool("Search file contents with a Python regular expression.",
+      regex=("string", "Python regex", True),
+      path=("string", "file or directory to search (default '.')", False))
+def grep(regex, path="."):
+    rx = re.compile(regex)
+    base = safe_path(path)
+    files = [base] if base.is_file() else list(walk(base))
+    hits = []
+    for f in files:
+        try:
+            text = f.read_text()
+        except (UnicodeDecodeError, OSError):
+            continue          # binary or unreadable: skip
+        for i, line in enumerate(text.splitlines(), 1):
+            if rx.search(line):
+                hits.append(f"{f.relative_to(ROOT)}:{i}: {line.strip()}")
+            if len(hits) >= 200:
+                return "\n".join(hits) + "\n...(truncated at 200 matches)"
+    return "\n".join(hits) or "(no matches)"
 
 
 def run_tool(name: str, args: dict) -> str:
