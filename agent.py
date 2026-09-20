@@ -2,7 +2,7 @@
 """A coding agent in <500 lines. Stdlib only.
 
 Speaks to any OpenAI-compatible /v1/chat/completions endpoint.
-Usage: python agent.py ["do the thing"]           (no prompt -> REPL)
+Usage: python agent.py [--yes] ["do the thing"]   (no prompt -> REPL)
 """
 import fnmatch
 import json
@@ -21,6 +21,8 @@ ROOT = pathlib.Path.cwd()          # the agent may only touch files under here
 MAX_TOOL_OUTPUT = 20_000           # chars; tool results are truncated to this
 MAX_STEPS = 50                     # tool rounds per user turn
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv"}
+AUTO_APPROVE = "--yes" in sys.argv or "-y" in sys.argv
+GATED = {"write_file", "edit_file", "bash"}
 
 
 def chat(messages: list, tools: list) -> dict:
@@ -178,6 +180,23 @@ def run_tool(name: str, args: dict) -> str:
     return out
 
 
+# --- permission gate -------------------------------------------------------
+def confirm(name: str, args: dict) -> bool:
+    """Ask the human before anything that writes to disk or runs a command."""
+    if AUTO_APPROVE:
+        return True
+    preview = args.get("command") or args.get("path", "?")
+    print(f"\n[{name}] {preview}")
+    body = args.get("content") or args.get("new")
+    if body:
+        for line in body.splitlines()[:10]:
+            print(f"  | {line}")
+    try:
+        return input("allow? [y/N] ").strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
 # --- agent loop ------------------------------------------------------------
 SYSTEM_PROMPT = f"""You are a coding agent working in {ROOT}.
 
@@ -207,7 +226,10 @@ def run_turn(messages: list) -> None:
             args = raw if isinstance(raw, dict) else json.loads(raw or "{}")
             short = json.dumps(args)[:80]
             print(f"\u2192 {name}({short})")
-            result = run_tool(name, args)
+            if name in GATED and not confirm(name, args):
+                result = "user denied this action"
+            else:
+                result = run_tool(name, args)
             messages.append({"role": "tool", "tool_call_id": call["id"],
                              "content": result})
     messages.append({"role": "user",
