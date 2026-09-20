@@ -12,6 +12,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -21,6 +22,7 @@ MODEL = os.environ.get("AGENT_MODEL", "gpt-4o-mini")
 ROOT = pathlib.Path.cwd()          # the agent may only touch files under here
 MAX_TOOL_OUTPUT = 20_000           # chars; tool results are truncated to this
 MAX_STEPS = 50                     # tool rounds per user turn
+MAX_RETRIES = 4                    # attempts per API call before giving up
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv"}
 AUTO_APPROVE = "--yes" in sys.argv or "-y" in sys.argv
 GATED = {"write_file", "edit_file", "bash"}
@@ -52,8 +54,17 @@ def merge_delta(msg: dict, delta: dict) -> None:
         slot["function"]["arguments"] += fn.get("arguments") or ""
 
 
-def chat(messages: list, tools: list, stream: bool = True) -> dict:
+class Retryable(RuntimeError):
+    """A failure worth another attempt: rate limit, 5xx, dropped connection."""
+
+    def __init__(self, message, delay=None):
+        super().__init__(message)
+        self.delay = delay
+
+
+def once(messages: list, tools: list, stream: bool = True) -> dict:
     """One round-trip. Returns the assistant message dict, printing as it streams."""
+    msg = None
     try:
         with post(messages, tools, stream) as resp:
             if not stream:
@@ -69,9 +80,14 @@ def chat(messages: list, tools: list, stream: bool = True) -> dict:
                 choices = json.loads(data).get("choices") or [{}]
                 merge_delta(msg, choices[0].get("delta") or {})
     except urllib.error.HTTPError as e:
-        raise RuntimeError(f"API {e.code}: {e.read().decode()[:500]}")
+        detail = f"API {e.code}: {e.read().decode()[:200]}"
+        if e.code == 429 or e.code >= 500:
+            raise Retryable(detail, int(e.headers.get("Retry-After") or 0) or None)
+        raise RuntimeError(detail)
     except OSError as e:               # DNS, TLS, timeout, connection reset
-        raise RuntimeError(f"API unreachable: {e}")
+        if msg and (msg["content"] or msg["calls"]):
+            raise RuntimeError(f"stream died mid-message: {e}")
+        raise Retryable(f"API unreachable: {e}")
     calls = msg.pop("calls")
     if calls:
         msg["tool_calls"] = [calls[i] for i in sorted(calls)]
@@ -80,6 +96,18 @@ def chat(messages: list, tools: list, stream: bool = True) -> dict:
     else:
         msg["content"] = None
     return msg
+
+
+def chat(messages: list, tools: list, stream: bool = True) -> dict:
+    """once(), with exponential backoff on the failures that deserve it."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            return once(messages, tools, stream)
+        except Retryable as e:
+            delay = e.delay or min(2 ** attempt, 30)
+            print(f"[{e} | retry {attempt + 1}/{MAX_RETRIES} in {delay}s]")
+            time.sleep(delay)
+    raise RuntimeError(f"gave up after {MAX_RETRIES} attempts")
 
 
 # --- tools -----------------------------------------------------------------
