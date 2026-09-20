@@ -4,6 +4,7 @@
 Speaks to any OpenAI-compatible /v1/chat/completions endpoint.
 Usage: python agent.py ["do the thing"]           (no prompt -> REPL)
 """
+import fnmatch
 import json
 import os
 import pathlib
@@ -17,6 +18,7 @@ MODEL = os.environ.get("AGENT_MODEL", "gpt-4o-mini")
 ROOT = pathlib.Path.cwd()          # the agent may only touch files under here
 MAX_TOOL_OUTPUT = 20_000           # chars; tool results are truncated to this
 MAX_STEPS = 50                     # tool rounds per user turn
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv"}
 
 
 def chat(messages: list, tools: list) -> dict:
@@ -66,6 +68,13 @@ def safe_path(p: str) -> pathlib.Path:
     return path
 
 
+def walk(base: pathlib.Path):
+    """Every file under base, skipping noise directories."""
+    for path in sorted(base.rglob("*")):
+        if path.is_file() and not SKIP_DIRS & set(path.relative_to(ROOT).parts):
+            yield path
+
+
 @tool("Read a file. Returns its contents with 1-based line numbers.",
       path=("string", "file path relative to the workspace root", True))
 def read_file(path):
@@ -103,6 +112,22 @@ def edit_file(path, old, new):
         return f"error: old text occurs {n} times; include more context"
     f.write_text(text.replace(old, new))
     return "ok"
+
+
+@tool("List files recursively, optionally filtered by a glob on the filename.",
+      path=("string", "directory to list (default '.')", False),
+      pattern=("string", "glob matched against the file name, e.g. '*.py'",
+               False))
+def list_files(path=".", pattern="*"):
+    base = safe_path(path)
+    if not base.is_dir():
+        return "error: not a directory"
+    hits = [str(f.relative_to(ROOT)) for f in walk(base)
+            if fnmatch.fnmatch(f.name, pattern)]
+    out = "\n".join(hits[:500])
+    if len(hits) > 500:
+        out += f"\n...and {len(hits) - 500} more"
+    return out or "(no matches)"
 
 
 def run_tool(name: str, args: dict) -> str:
