@@ -1,3 +1,4 @@
 demo/
 transcript.txt
 __pycache__/
+.agent/
