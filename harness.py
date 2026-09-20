@@ -23,6 +23,7 @@ ROOT = pathlib.Path.cwd()          # the agent may only touch files under here
 MAX_TOOL_OUTPUT = 20_000           # chars; tool results are truncated to this
 MAX_STEPS = 50                     # tool rounds per user turn
 MAX_RETRIES = 4                    # attempts per API call before giving up
+COMPACT_AT = int(os.environ.get("AGENT_COMPACT_AT", 120_000))  # chars, not tokens
 SKIP_DIRS = {".git", ".agent", "node_modules", "__pycache__", ".venv"}
 SESSION_DIR = ROOT / ".agent"      # transcripts, one JSON file per session
 AUTO_APPROVE = "--yes" in sys.argv or "-y" in sys.argv
@@ -299,10 +300,37 @@ When the task is done, stop calling tools and reply in plain text with what you
 changed and what the tests said. If you cannot do something, say so plainly."""
 
 
+def cut_point(messages: list) -> int:
+    """Halfway, then forward to a boundary that keeps tool results with their call."""
+    i = 1 + (len(messages) - 1) // 2
+    while i < len(messages) and messages[i].get("role") == "tool":
+        i += 1
+    return i
+
+
+def compact(messages: list) -> None:
+    """Replace the older half of the transcript with a summary, in place."""
+    if len(json.dumps(messages)) < COMPACT_AT or len(messages) < 8:
+        return
+    cut = cut_point(messages)
+    old = messages[1:cut]
+    if not old:
+        return
+    print(f"[compacting {len(old)} messages]")
+    ask = [messages[0], *old, {"role": "user", "content":
+           "Summarize the work so far for your own future reference: files "
+           "read and changed, decisions made, what is still unfinished. Be "
+           "specific about names and line numbers. No preamble."}]
+    summary = chat(ask, [], stream=False).get("content") or "(summary failed)"
+    messages[1:cut] = [{"role": "user",
+                        "content": f"Summary of earlier work:\n{summary}"}]
+
+
 def run_turn(messages: list) -> None:
     """Drive the model until it answers with plain text (or hits the cap)."""
     schemas = [s for s, _ in TOOLS.values()]
     for _ in range(MAX_STEPS):
+        compact(messages)
         msg = chat(messages, schemas)
         messages.append(msg)          # verbatim: tool_calls must round-trip
         if not msg.get("tool_calls"):
