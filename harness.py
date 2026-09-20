@@ -26,21 +26,60 @@ AUTO_APPROVE = "--yes" in sys.argv or "-y" in sys.argv
 GATED = {"write_file", "edit_file", "bash"}
 
 
-def chat(messages: list, tools: list) -> dict:
-    """One blocking round-trip. Returns the assistant message dict."""
-    body = json.dumps({"model": MODEL, "messages": messages,
-                       "tools": tools, "tool_choice": "auto"}).encode()
+def post(messages: list, tools: list, stream: bool):
+    """Open the HTTP response for one completion request."""
+    body = json.dumps({"model": MODEL, "messages": messages, "tools": tools,
+                       "tool_choice": "auto", "stream": stream}).encode()
     req = urllib.request.Request(
         f"{BASE_URL}/chat/completions", data=body,
         headers={"Authorization": f"Bearer {API_KEY}",
                  "Content-Type": "application/json"})
+    return urllib.request.urlopen(req, timeout=120)
+
+
+def merge_delta(msg: dict, delta: dict) -> None:
+    """Fold one SSE delta into the assistant message being assembled."""
+    if delta.get("content"):
+        print(delta["content"], end="", flush=True)
+        msg["content"] += delta["content"]
+    for part in delta.get("tool_calls") or []:
+        slot = msg["calls"].setdefault(part.get("index", 0),
+                                       {"id": "", "type": "function",
+                                        "function": {"name": "", "arguments": ""}})
+        slot["id"] += part.get("id") or ""
+        fn = part.get("function") or {}
+        slot["function"]["name"] += fn.get("name") or ""
+        slot["function"]["arguments"] += fn.get("arguments") or ""
+
+
+def chat(messages: list, tools: list, stream: bool = True) -> dict:
+    """One round-trip. Returns the assistant message dict, printing as it streams."""
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            return json.loads(resp.read())["choices"][0]["message"]
+        with post(messages, tools, stream) as resp:
+            if not stream:
+                return json.loads(resp.read())["choices"][0]["message"]
+            msg = {"role": "assistant", "content": "", "calls": {}}
+            for raw in resp:                      # server-sent events, one per line
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                choices = json.loads(data).get("choices") or [{}]
+                merge_delta(msg, choices[0].get("delta") or {})
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"API {e.code}: {e.read().decode()[:500]}")
     except OSError as e:               # DNS, TLS, timeout, connection reset
         raise RuntimeError(f"API unreachable: {e}")
+    calls = msg.pop("calls")
+    if calls:
+        msg["tool_calls"] = [calls[i] for i in sorted(calls)]
+    if msg["content"]:
+        print()                                   # close the streamed line
+    else:
+        msg["content"] = None
+    return msg
 
 
 # --- tools -----------------------------------------------------------------
@@ -237,8 +276,6 @@ def run_turn(messages: list) -> None:
     for _ in range(MAX_STEPS):
         msg = chat(messages, schemas)
         messages.append(msg)          # verbatim: tool_calls must round-trip
-        if msg.get("content"):
-            print(msg["content"])
         if not msg.get("tool_calls"):
             return
         for call in msg["tool_calls"]:
@@ -257,7 +294,6 @@ def run_turn(messages: list) -> None:
                      "content": "Stop: step limit reached. Summarize what you did."})
     final = chat(messages, [])
     messages.append(final)
-    print(final.get("content", ""))
 
 
 def main() -> None:
