@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""An agent harness in <500 lines. Stdlib, plus ddgs for web_search.
+"""An agent harness in <500 lines. Needs requests, plus ddgs for web_search.
 
 agent.py plus the machinery that makes it livable: streaming output,
 retries, resumable sessions, context compaction, and cancellation.
@@ -15,8 +15,8 @@ import re
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
+
+import requests
 
 BASE_URL = os.environ.get("AGENT_BASE_URL", "https://api.openai.com/v1")
 API_KEY = os.environ.get("AGENT_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
@@ -25,6 +25,7 @@ ROOT = pathlib.Path.cwd()          # the agent may only touch files under here
 MAX_TOOL_OUTPUT = 20_000           # chars; tool results are truncated to this
 PAGE_CHARS = 10_000                # chars of page text per fetch_url call
 UA = "Mozilla/5.0 (compatible; tiny-agent/1.0)"   # fetch_url identifies itself
+HTTP = requests.Session()          # keep-alive: one TLS handshake, not one per call
 MAX_STEPS = 50                     # tool rounds per user turn
 MAX_RETRIES = 4                    # attempts per API call before giving up
 COMPACT_AT = int(os.environ.get("AGENT_COMPACT_AT", 120_000))  # chars, not tokens
@@ -47,13 +48,10 @@ changed and what the tests said. If you cannot do something, say so plainly."""
 
 def post(messages: list, tools: list, stream: bool):
     """Open the HTTP response for one completion request."""
-    body = json.dumps({"model": MODEL, "messages": messages, "tools": tools,
-                       "tool_choice": "auto", "stream": stream}).encode()
-    req = urllib.request.Request(
-        f"{BASE_URL}/chat/completions", data=body,
-        headers={"Authorization": f"Bearer {API_KEY}",
-                 "Content-Type": "application/json"})
-    return urllib.request.urlopen(req, timeout=120)
+    return HTTP.post(f"{BASE_URL}/chat/completions", timeout=120, stream=stream,
+                     headers={"Authorization": f"Bearer {API_KEY}"},
+                     json={"model": MODEL, "messages": messages, "tools": tools,
+                           "tool_choice": "auto", "stream": stream})
 
 
 def merge_delta(msg: dict, delta: dict) -> None:
@@ -83,11 +81,13 @@ def once(messages: list, tools: list, stream: bool = True) -> dict:
     """One round-trip. Returns the assistant message dict, printing as it streams."""
     msg = None
     try:
-        with post(messages, tools, stream) as resp:
+        resp = post(messages, tools, stream)
+        resp.raise_for_status()               # before `with`, which would close the body
+        with resp:
             if not stream:
-                return json.loads(resp.read())["choices"][0]["message"]
+                return resp.json()["choices"][0]["message"]
             msg = {"role": "assistant", "content": "", "calls": {}}
-            for raw in resp:                      # server-sent events, one per line
+            for raw in resp.iter_lines():         # server-sent events, one per line
                 line = raw.decode("utf-8", "replace").strip()
                 if not line.startswith("data:"):
                     continue
@@ -96,12 +96,12 @@ def once(messages: list, tools: list, stream: bool = True) -> dict:
                     break
                 choices = json.loads(data).get("choices") or [{}]
                 merge_delta(msg, choices[0].get("delta") or {})
-    except urllib.error.HTTPError as e:
-        detail = f"API {e.code}: {e.read().decode()[:200]}"
-        if e.code == 429 or e.code >= 500:
-            raise Retryable(detail, int(e.headers.get("Retry-After") or 0) or None)
+    except requests.HTTPError:
+        detail = f"API {resp.status_code}: {resp.text[:200]}"
+        if resp.status_code == 429 or resp.status_code >= 500:
+            raise Retryable(detail, int(resp.headers.get("Retry-After") or 0) or None)
         raise RuntimeError(detail)
-    except OSError as e:               # DNS, TLS, timeout, connection reset
+    except requests.RequestException as e:   # DNS, TLS, timeout, connection reset
         if msg and (msg["content"] or msg["calls"]):
             raise RuntimeError(f"stream died mid-message: {e}")
         raise Retryable(f"API unreachable: {e}")
@@ -293,14 +293,14 @@ def fetch_url(url: str, start: int = 0):
     if not url.startswith(("http://", "https://")):
         return "error: url must start with http:// or https://"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=30) as r:
-            kind = r.headers.get_content_type()
-            if not (kind.startswith("text/") or "json" in kind or "xml" in kind):
-                return f"error: {kind} is not text"
-            body = r.read(4_000_000).decode(
-                r.headers.get_content_charset() or "utf-8", "replace")
-    except Exception as e:        # DNS, TLS, 404, timeout
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=30, stream=True)
+        r.raise_for_status()
+        kind = r.headers.get("Content-Type", "").split(";")[0].strip()
+        if not (kind.startswith("text/") or "json" in kind or "xml" in kind):
+            return f"error: {kind} is not text"
+        enc = r.encoding if "charset=" in r.headers.get("Content-Type", "") else "utf-8"
+        body = r.raw.read(4_000_000, decode_content=True).decode(enc, "replace")
+    except requests.RequestException as e:        # DNS, TLS, 404, timeout
         return f"error: fetch failed: {type(e).__name__}: {e}"
     if kind.startswith("text/html"):
         body = re.sub(r"(?is)<(script|style|noscript|svg|head|nav|footer|aside"

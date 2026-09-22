@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A coding agent in <500 lines. Stdlib, plus ddgs for web_search.
+"""A coding agent in <500 lines. Needs requests, plus ddgs for web_search.
 
 Speaks to any OpenAI-compatible /v1/chat/completions endpoint.
 Usage: python agent.py [--yes] ["do the thing"]   (no prompt -> REPL)
@@ -13,8 +13,8 @@ import pathlib
 import re
 import subprocess
 import sys
-import urllib.error
-import urllib.request
+
+import requests
 
 BASE_URL = os.environ.get("AGENT_BASE_URL", "https://api.openai.com/v1")
 API_KEY = os.environ.get("AGENT_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
@@ -42,18 +42,16 @@ changed and what the tests said. If you cannot do something, say so plainly."""
 
 def chat(messages: list, tools: list) -> dict:
     """One blocking round-trip. Returns the assistant message dict."""
-    body = json.dumps({"model": MODEL, "messages": messages,
-                       "tools": tools, "tool_choice": "auto"}).encode()
-    req = urllib.request.Request(
-        f"{BASE_URL}/chat/completions", data=body,
-        headers={"Authorization": f"Bearer {API_KEY}",
-                 "Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            return json.loads(resp.read())["choices"][0]["message"]
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"API {e.code}: {e.read().decode()[:500]}")
-    except OSError as e:               # DNS, TLS, timeout, connection reset
+        r = requests.post(f"{BASE_URL}/chat/completions", timeout=120,
+                          headers={"Authorization": f"Bearer {API_KEY}"},
+                          json={"model": MODEL, "messages": messages,
+                                "tools": tools, "tool_choice": "auto"})
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]
+    except requests.HTTPError:
+        raise RuntimeError(f"API {r.status_code}: {r.text[:500]}")
+    except requests.RequestException as e:   # DNS, TLS, timeout, connection reset
         raise RuntimeError(f"API unreachable: {e}")
 
 
@@ -223,14 +221,14 @@ def fetch_url(url: str, start: int = 0):
     if not url.startswith(("http://", "https://")):
         return "error: url must start with http:// or https://"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=30) as r:
-            kind = r.headers.get_content_type()
-            if not (kind.startswith("text/") or "json" in kind or "xml" in kind):
-                return f"error: {kind} is not text"
-            body = r.read(4_000_000).decode(
-                r.headers.get_content_charset() or "utf-8", "replace")
-    except Exception as e:        # DNS, TLS, 404, timeout
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=30, stream=True)
+        r.raise_for_status()
+        kind = r.headers.get("Content-Type", "").split(";")[0].strip()
+        if not (kind.startswith("text/") or "json" in kind or "xml" in kind):
+            return f"error: {kind} is not text"
+        enc = r.encoding if "charset=" in r.headers.get("Content-Type", "") else "utf-8"
+        body = r.raw.read(4_000_000, decode_content=True).decode(enc, "replace")
+    except requests.RequestException as e:        # DNS, TLS, 404, timeout
         return f"error: fetch failed: {type(e).__name__}: {e}"
     if kind.startswith("text/html"):
         body = re.sub(r"(?is)<(script|style|noscript|svg|head|nav|footer|aside"
