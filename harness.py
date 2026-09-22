@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""An agent harness in <500 lines. Stdlib only.
+"""An agent harness in <500 lines. Stdlib, plus ddgs for web_search.
 
 agent.py plus the machinery that makes it livable: streaming output,
 retries, resumable sessions, context compaction, and cancellation.
 Usage: python harness.py [--yes] [--resume] ["do the thing"]
 """
 import fnmatch
+import html
+import inspect
 import json
 import os
 import pathlib
@@ -21,6 +23,8 @@ API_KEY = os.environ.get("AGENT_API_KEY") or os.environ.get("OPENAI_API_KEY", ""
 MODEL = os.environ.get("AGENT_MODEL", "gpt-4o-mini")
 ROOT = pathlib.Path.cwd()          # the agent may only touch files under here
 MAX_TOOL_OUTPUT = 20_000           # chars; tool results are truncated to this
+PAGE_CHARS = 10_000                # chars of page text per fetch_url call
+UA = "Mozilla/5.0 (compatible; tiny-agent/1.0)"   # fetch_url identifies itself
 MAX_STEPS = 50                     # tool rounds per user turn
 MAX_RETRIES = 4                    # attempts per API call before giving up
 COMPACT_AT = int(os.environ.get("AGENT_COMPACT_AT", 120_000))  # chars, not tokens
@@ -28,6 +32,17 @@ SKIP_DIRS = {".git", ".agent", "node_modules", "__pycache__", ".venv"}
 SESSION_DIR = ROOT / ".agent"      # transcripts, one JSON file per session
 AUTO_APPROVE = "--yes" in sys.argv or "-y" in sys.argv
 GATED = {"write_file", "edit_file", "bash"}
+SYSTEM_PROMPT = f"""You are a coding agent working in {ROOT}.
+
+Use the tools to inspect the project before you change anything; never guess
+what a file contains. Prefer edit_file over rewriting a whole file with
+write_file. When tests exist, run them with bash before and after your change.
+Keep shell commands short and non-interactive. For anything outside this
+workspace, web_search with keywords, then fetch_url the best hit and cite it.
+
+Work in small steps: one tool call, look at the result, decide the next one.
+When the task is done, stop calling tools and reply in plain text with what you
+changed and what the tests said. If you cannot do something, say so plainly."""
 
 
 def post(messages: list, tools: list, stream: bool):
@@ -113,25 +128,29 @@ def chat(messages: list, tools: list, stream: bool = True) -> dict:
 
 
 # --- tools -----------------------------------------------------------------
-# name -> (json schema shown to the model, python function that runs it)
-TOOLS: dict = {}
+TOOLS: dict = {}       # name -> python function
+SCHEMAS: list = []     # what the model sees, in registration order
+JSON_TYPES = {str: "string", int: "integer", bool: "boolean"}
 
 
-def tool(desc, **params):
-    """Register a function as a tool. params: name=(json_type, help, required)."""
-    def deco(fn):
-        TOOLS[fn.__name__] = ({
-            "type": "function",
-            "function": {
-                "name": fn.__name__, "description": desc,
-                "parameters": {
-                    "type": "object",
-                    "properties": {k: {"type": t, "description": d}
-                                   for k, (t, d, _) in params.items()},
-                    "required": [k for k, (_, _, r) in params.items() if r]}}},
-            fn)
+def tool(description: str, **params: str):
+    """Register fn as a tool. The JSON type comes from each parameter's
+    annotation, a parameter with no default is required, and params holds
+    one line of help per parameter."""
+    def register(fn):
+        properties, required = {}, []
+        for name, p in inspect.signature(fn).parameters.items():
+            properties[name] = {"type": JSON_TYPES[p.annotation],
+                                "description": params[name]}
+            if p.default is p.empty:
+                required.append(name)
+        SCHEMAS.append({"type": "function", "function": {
+            "name": fn.__name__, "description": description,
+            "parameters": {"type": "object", "properties": properties,
+                           "required": required}}})
+        TOOLS[fn.__name__] = fn
         return fn
-    return deco
+    return register
 
 
 def safe_path(p: str) -> pathlib.Path:
@@ -150,26 +169,26 @@ def walk(base: pathlib.Path):
 
 
 @tool("Read a file. Returns its contents with 1-based line numbers.",
-      path=("string", "file path relative to the workspace root", True),
-      start=("integer", "first line to return (1-based, default 1)", False),
-      end=("integer", "last line to return (default: end of file)", False))
-def read_file(path, start=1, end=None):
+      path="file path relative to the workspace root",
+      start="first line to return (1-based, default 1)",
+      end="last line to return (default: end of file)")
+def read_file(path: str, start: int = 1, end: int = None):
     f = safe_path(path)
     if not f.is_file():
         return "error: not found"
     lines = f.read_text(errors="replace").splitlines()
-    start, end = max(int(start), 1), len(lines) if end is None else int(end)
-    out = "\n".join(f"{i}: {lines[i - 1]}"
-                    for i in range(start, min(end, len(lines)) + 1))
+    start = max(int(start), 1)
+    end = len(lines) if end is None else min(int(end), len(lines))
+    out = "\n".join(f"{i}: {lines[i - 1]}" for i in range(start, end + 1))
     if end < len(lines):
         out += f"\n...[{len(lines) - end} more lines; read them with start={end + 1}]"
     return out or "(empty range)"
 
 
 @tool("Create or overwrite a file with exact content.",
-      path=("string", "file path relative to the workspace root", True),
-      content=("string", "full file content", True))
-def write_file(path, content):
+      path="file path relative to the workspace root",
+      content="full file content")
+def write_file(path: str, content: str):
     f = safe_path(path)
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text(content)
@@ -177,11 +196,10 @@ def write_file(path, content):
 
 
 @tool("Replace an exact substring in a file. `old` must appear exactly once.",
-      path=("string", "file path relative to the workspace root", True),
-      old=("string", "exact text to replace, with enough context to be unique",
-           True),
-      new=("string", "replacement text", True))
-def edit_file(path, old, new):
+      path="file path relative to the workspace root",
+      old="exact text to replace, with enough context to be unique",
+      new="replacement text")
+def edit_file(path: str, old: str, new: str):
     f = safe_path(path)
     if not f.is_file():
         return "error: not found"
@@ -196,10 +214,9 @@ def edit_file(path, old, new):
 
 
 @tool("List files recursively, optionally filtered by a glob on the filename.",
-      path=("string", "directory to list (default '.')", False),
-      pattern=("string", "glob matched against the file name, e.g. '*.py'",
-               False))
-def list_files(path=".", pattern="*"):
+      path="directory to list (default '.')",
+      pattern="glob matched against the file name, e.g. '*.py'")
+def list_files(path: str = ".", pattern: str = "*"):
     base = safe_path(path)
     if not base.is_dir():
         return "error: not a directory"
@@ -212,9 +229,9 @@ def list_files(path=".", pattern="*"):
 
 
 @tool("Search file contents with a Python regular expression.",
-      regex=("string", "Python regex", True),
-      path=("string", "file or directory to search (default '.')", False))
-def grep(regex, path="."):
+      regex="Python regex",
+      path="file or directory to search (default '.')")
+def grep(regex: str, path: str = "."):
     rx = re.compile(regex)
     base = safe_path(path)
     files = [base] if base.is_file() else list(walk(base))
@@ -233,8 +250,8 @@ def grep(regex, path="."):
 
 
 @tool("Run a shell command in the workspace root. 60s timeout.",
-      command=("string", "shell command", True))
-def bash(command):
+      command="shell command")
+def bash(command: str):
     try:
         p = subprocess.run(command, shell=True, cwd=ROOT, text=True,
                            capture_output=True, timeout=60)
@@ -243,10 +260,69 @@ def bash(command):
     return f"{p.stdout}{p.stderr}\n[exit {p.returncode}]"
 
 
+@tool("Search the web with DuckDuckGo. Returns ranked title/url/snippet "
+      "triples; the snippet is a teaser, so fetch_url the ones that matter.",
+      query="search query, as you would type it into a search box",
+      max_results="how many results to return (default 5, max 25)")
+def web_search(query: str, max_results: int = 5):
+    try:
+        from ddgs import DDGS     # pip install ddgs
+    except ImportError:
+        return "error: web search needs the ddgs package (pip install ddgs)"
+    n = max(1, min(int(max_results), 25))
+    hits = []
+    for _ in (1, 2):              # a rotated backend comes back empty at random
+        try:
+            hits = DDGS(timeout=30).text(query, max_results=n) or []
+        except Exception as e:    # rate limits, captchas, DNS
+            if "no results" not in str(e).lower():   # ddgs raises on empty too
+                return f"error: search failed: {type(e).__name__}: {e}"
+        if hits:
+            break
+    out = [f"{i}. {h.get('title', '')}\n   {h.get('href', '')}\n   "
+           f"{' '.join((h.get('body') or '').split())}"
+           for i, h in enumerate(hits, 1)]
+    return "\n".join(out) or "(no results)"
+
+
+@tool("Fetch a URL and return it as plain text, scripts and tags stripped. "
+      "Use it to actually read a page web_search pointed at.",
+      url="absolute http:// or https:// URL",
+      start="character offset to resume from (default 0)")
+def fetch_url(url: str, start: int = 0):
+    if not url.startswith(("http://", "https://")):
+        return "error: url must start with http:// or https://"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            kind = r.headers.get_content_type()
+            if not (kind.startswith("text/") or "json" in kind or "xml" in kind):
+                return f"error: {kind} is not text"
+            body = r.read(4_000_000).decode(
+                r.headers.get_content_charset() or "utf-8", "replace")
+    except Exception as e:        # DNS, TLS, 404, timeout
+        return f"error: fetch failed: {type(e).__name__}: {e}"
+    if kind.startswith("text/html"):
+        body = re.sub(r"(?is)<(script|style|noscript|svg|head|nav|footer|aside"
+                      r"|form)\b.*?</\1>", " ", body)
+        main = re.search(r"(?is)<(main|article)\b.*?</\1>", body)   # skip the chrome
+        body = main.group(0) if main else body
+        body = re.sub(r"(?i)<br\s*/?>|</(p|div|li|tr|h[1-6])>", "\n", body)
+        body = html.unescape(re.sub(r"(?s)<!--.*?-->|<[^>]+>", " ", body))
+    text = "\n".join(ln.strip() for ln in re.sub(r"[ \t]+", " ", body).splitlines()
+                     if ln.strip())
+    start = max(int(start), 0)
+    out = text[start:start + PAGE_CHARS]
+    if len(text) > start + PAGE_CHARS:
+        out += (f"\n...[{len(text) - start - PAGE_CHARS} more chars; "
+                f"continue with start={start + PAGE_CHARS}]")
+    return out or "(no text on page)"
+
+
 @tool("Ask the human a question and wait for their answer. Use only for a "
       "decision the code cannot answer, never to ask permission.",
-      question=("string", "a single, specific question", True))
-def ask_user(question):
+      question="a single, specific question")
+def ask_user(question: str):
     if AUTO_APPROVE:
         return "error: running unattended (--yes); use your best judgement"
     print(f"\n[?] {question}")
@@ -254,20 +330,6 @@ def ask_user(question):
         return input("your answer: ").strip() or "(no answer given)"
     except (EOFError, KeyboardInterrupt):
         return "(no answer given)"
-
-
-def run_tool(name: str, args: dict) -> str:
-    """Dispatch one tool call. Errors come back as text so the model can retry."""
-    if name not in TOOLS:
-        return f"error: unknown tool {name}"
-    try:
-        out = TOOLS[name][1](**args)
-    except Exception as e:
-        out = f"error: {type(e).__name__}: {e}"
-    if len(out) > MAX_TOOL_OUTPUT:
-        extra = len(out) - MAX_TOOL_OUTPUT
-        out = out[:MAX_TOOL_OUTPUT] + f"\n...[truncated {extra} chars]"
-    return out
 
 
 # --- permission gate -------------------------------------------------------
@@ -287,19 +349,29 @@ def confirm(name: str, args: dict) -> bool:
         return False
 
 
+# --- dispatch --------------------------------------------------------------
+def run_tool(call: dict) -> str:
+    """Execute one tool call from the model. Every failure comes back as
+    text, so the model can read it and try something else."""
+    name = call["function"]["name"]
+    raw = call["function"]["arguments"]
+    try:
+        args = raw if isinstance(raw, dict) else json.loads(raw or "{}")
+        print(f"\u2192 {name}({json.dumps(args)[:80]})")
+        if name not in TOOLS:
+            return f"error: unknown tool {name}"
+        if name in GATED and not confirm(name, args):
+            return "user denied this action"
+        out = TOOLS[name](**args)
+    except Exception as e:
+        out = f"error: {type(e).__name__}: {e}"
+    if len(out) > MAX_TOOL_OUTPUT:
+        extra = len(out) - MAX_TOOL_OUTPUT
+        out = out[:MAX_TOOL_OUTPUT] + f"\n...[truncated {extra} chars]"
+    return out
+
+
 # --- agent loop ------------------------------------------------------------
-SYSTEM_PROMPT = f"""You are a coding agent working in {ROOT}.
-
-Use the tools to inspect the project before you change anything; never guess
-what a file contains. Prefer edit_file over rewriting a whole file with
-write_file. When tests exist, run them with bash before and after your change.
-Keep shell commands short and non-interactive.
-
-Work in small steps: one tool call, look at the result, decide the next one.
-When the task is done, stop calling tools and reply in plain text with what you
-changed and what the tests said. If you cannot do something, say so plainly."""
-
-
 def cut_point(messages: list) -> int:
     """Halfway, then forward to a boundary that keeps tool results with their call."""
     i = 1 + (len(messages) - 1) // 2
@@ -337,26 +409,17 @@ def seal(messages: list) -> None:
     messages.append({"role": "user", "content": "[interrupted by the user]"})
 
 
-def steps(messages: list, schemas: list) -> None:
+def steps(messages: list) -> None:
     """The loop proper: model, tools, repeat."""
     for _ in range(MAX_STEPS):
         compact(messages)
-        msg = chat(messages, schemas)
+        msg = chat(messages, SCHEMAS)
         messages.append(msg)          # verbatim: tool_calls must round-trip
         if not msg.get("tool_calls"):
             return
         for call in msg["tool_calls"]:
-            name = call["function"]["name"]
-            raw = call["function"]["arguments"]
-            args = raw if isinstance(raw, dict) else json.loads(raw or "{}")
-            short = json.dumps(args)[:80]
-            print(f"\u2192 {name}({short})")
-            if name in GATED and not confirm(name, args):
-                result = "user denied this action"
-            else:
-                result = run_tool(name, args)
             messages.append({"role": "tool", "tool_call_id": call["id"],
-                             "content": result})
+                             "content": run_tool(call)})
     messages.append({"role": "user",
                      "content": "Stop: step limit reached. Summarize what you did."})
     messages.append(chat(messages, []))
@@ -365,7 +428,7 @@ def steps(messages: list, schemas: list) -> None:
 def run_turn(messages: list) -> None:
     """One turn, interruptible. Ctrl-C ends the turn, not the session."""
     try:
-        steps(messages, [s for s, _ in TOOLS.values()])
+        steps(messages)
     except KeyboardInterrupt:
         print("\n[cancelled]")
         seal(messages)
