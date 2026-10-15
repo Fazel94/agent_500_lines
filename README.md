@@ -140,5 +140,5 @@ What separates `harness.py` from something you'd ship to strangers, none of whic
 
 ## Read more
 
-- [Build a coding agent in about 300 lines of Python](https://kialog.nlogn.ir/posts/coding-agent-in-300-lines/): every line of `agent.py`, and why `edit_file`'s "exactly once" rule matters more than any prompt.
+- [Build a coding agent in 306 lines of Python](https://kialog.nlogn.ir/posts/coding-agent-in-300-lines/): every line of `agent.py`, and why `edit_file`'s "exactly once" rule matters more than any prompt.
 - [What makes a coding agent usable: five fixes in 145 lines of Python](https://kialog.nlogn.ir/posts/making-coding-agents-usable/): the harness, one fix at a time.
