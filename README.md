@@ -63,10 +63,8 @@ With a prompt on the command line, the agent runs one turn and exits. With no pr
 | `agent.py` | 354 | The minimal agent: one HTTP call, nine tools, a loop |
 | `harness.py` | 499 | `agent.py` plus streaming, retries, sessions, compaction, cancellation |
 | `flaky_server.py` | 32 | A fake API for testing retries and streaming without a key |
-| `post.md` | | Line-by-line walkthrough of `agent.py` |
-| `post2.md` | | The five harness fixes and the one rule behind four of them |
 
-The two agents share everything except the 145 lines the harness adds, so `diff agent.py harness.py` shows exactly what each fix cost. `git log --reverse` reads in the same order as the posts, roughly one tool or one fix per commit.
+The two agents share everything except the 145 lines the harness adds, so `diff agent.py harness.py` shows exactly what each fix cost. `git log --reverse` reads in the same order as the blog posts below, roughly one tool or one fix per commit.
 
 ## How it works
 
@@ -142,5 +140,5 @@ What separates `harness.py` from something you'd ship to strangers, none of whic
 
 ## Read more
 
-- [Build a coding agent in about 300 lines of Python](post.md): every line of `agent.py`, and why `edit_file`'s "exactly once" rule matters more than any prompt.
-- [What makes a coding agent usable: five fixes in 145 lines of Python](post2.md): the harness, one fix at a time.
+- [Build a coding agent in about 300 lines of Python](https://kialog.nlogn.ir/posts/coding-agent-in-300-lines/): every line of `agent.py`, and why `edit_file`'s "exactly once" rule matters more than any prompt.
+- [What makes a coding agent usable: five fixes in 145 lines of Python](https://kialog.nlogn.ir/posts/making-coding-agents-usable/): the harness, one fix at a time.
